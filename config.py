@@ -1,5 +1,5 @@
 """
-Vkbro-MLX Agent Cache Proxy v2.7.0 — 配置模块
+Vkbro-MLX Agent Cache Proxy v2.8.1 — 配置模块
 ==============================================
 支持 .env 文件覆盖所有硬编码默认值。
 """

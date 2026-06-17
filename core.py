@@ -1,5 +1,5 @@
 """
-Vkbro-MLX Agent Cache Proxy v2.7.0 — 核心引擎
+Vkbro-MLX Agent Cache Proxy v2.8.1 — 核心引擎
 =============================================
 锚点引擎、消息重组引擎、缓存健康度、自动检查点、自动压缩、SSE 解析。
 所有函数接收 ProxyState 实例参数，不直接访问全局状态。
@@ -251,8 +251,22 @@ def rebuild_messages(state: ProxyState, messages: list[dict]) -> list[dict]:
                     m_tiny = dict(m)
                     m_tiny["content"] = f"[技能已加载: {skill_name}]"
                     tool_loads.append(m_tiny)
+                    if skill_name and skill_name != "unknown":
+                        state._loaded_skill_names.add(skill_name)
                 else:
-                    clean_conversation.append(m)
+                    # v2.8: 大体积工具输出截断（留头留尾）
+                    MAX_TOOL_CHARS = 500
+                    HEAD_CHARS = 150
+                    m_out = dict(m)
+                    raw = m_out.get("content", "")
+                    if len(raw) > MAX_TOOL_CHARS:
+                        tail_chars = MAX_TOOL_CHARS - HEAD_CHARS
+                        m_out["content"] = (
+                            raw[:HEAD_CHARS]
+                            + f"\n... (中间{len(raw)-MAX_TOOL_CHARS}字符省略) ...\n"
+                            + raw[-tail_chars:]
+                        )
+                    clean_conversation.append(m_out)
                 consumed_set.add(tid)
                 continue
 
@@ -340,6 +354,16 @@ def rebuild_messages(state: ProxyState, messages: list[dict]) -> list[dict]:
         )
         // 3
     )
+
+    # v2.8.1: 在对话块插入已加载技能清单，避免模型重复加载
+    if state._loaded_skill_names:
+        skill_list = "、".join(sorted(state._loaded_skill_names))
+        clean_conversation.insert(0, {
+            "role": "system",
+            "content": f"[已加载技能: {skill_list}] 以下技能已在本次会话中加载过，无需重复加载。",
+            "ephemeral": False,
+        })
+
     return system_msgs + clean_conversation + ephemeral
 
 
@@ -404,23 +428,6 @@ def _try_auto_compress(state: ProxyState) -> None:
 # 缓存健康度
 # ============================================================
 
-def _poll_mlx_status(state: ProxyState) -> tuple[int, int]:
-    """轮询 OMLX 的 prompt / cache token 统计。"""
-    try:
-        with httpx.Client(timeout=5) as c:
-            r = c.get("http://localhost:8001/v1/status", headers=OMLX_HEADERS)
-            s = r.json()
-        tp = s.get("total_prompt_tokens", 0)
-        tc = s.get("cache", {}).get("tokens_saved", 0)
-        delta_p = tp - state._last_mlx_prompt_total
-        delta_c = tc - state._last_mlx_cache_total
-        state._last_mlx_prompt_total = tp
-        state._last_mlx_cache_total = tc
-        return max(0, delta_p), max(0, delta_c)
-    except Exception:
-        return 0, 0
-
-
 def _update_stable_blocks(state: ProxyState) -> None:
     """从 OMLX 管理接口读取缓存块统计。"""
     try:
@@ -474,9 +481,11 @@ def update_cache_health(
         state.stream_miss_count += 1
         if state.stream_miss_count >= STREAM_MISS_THRESHOLD:
             state.fallback_mode = True
-        hit_rate = min(
-            1.0, state.frozen_token_count / max(prompt_tokens, 1)
-        )
+        # v2.8: 无缓存数据时不生成虚假命中率，保留上次值
+        _update_stable_blocks(state)
+        _try_auto_checkpoint(state)
+        _try_auto_compress(state)
+        return
 
     state.hit_rate_window.append(hit_rate)
     if len(state.hit_rate_window) > WINDOW_SIZE:

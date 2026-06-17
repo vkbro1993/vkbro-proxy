@@ -1,5 +1,5 @@
 """
-Vkbro-MLX Agent Cache Proxy v2.7.0 — FastAPI 路由 + SSE 代理
+Vkbro-MLX Agent Cache Proxy v2.8.1 — FastAPI 路由 + SSE 代理
 ===========================================================
 所有路由处理、上游模型发现、SSE 流式代理。
 create_app() 工厂函数返回配置好的 FastAPI 实例。
@@ -30,7 +30,6 @@ try:
     from .proxy_state import ProxyState
     from .core import (
         _build_tools_message,
-        _poll_mlx_status,
         extract_cached_tokens,
         parse_usage_from_sse,
         rebuild_messages,
@@ -52,7 +51,6 @@ except ImportError:
     from proxy_state import ProxyState  # type: ignore[no-redef]
     from core import (  # type: ignore[no-redef]
         _build_tools_message,
-        _poll_mlx_status,
         extract_cached_tokens,
         parse_usage_from_sse,
         rebuild_messages,
@@ -113,11 +111,34 @@ async def _resolve_model(
     return model_name
 
 
-async def _get_omlx_stats(client: httpx.AsyncClient) -> Optional[dict]:
+async def _resolve_model_async(
+    state: ProxyState, model_name: str
+) -> str:
+    """解析模型名：如果传入 \"omlx\"，则用新客户端动态发现实际模型。"""
+    if model_name == "omlx":
+        try:
+            async with httpx.AsyncClient(timeout=10) as hc:
+                r = await hc.get(OMLX_ADMIN_URL, headers=OMLX_HEADERS)
+                stats = r.json()
+                active = stats.get("active_models", {}).get("models", [])
+                if active:
+                    return active[0]["id"]
+                else:
+                    r2 = await hc.get(OMLX_MODELS_URL, headers=OMLX_HEADERS)
+                    all_models = r2.json().get("data", [])
+                    valid = [m["id"] for m in all_models if m["id"] != "MarkItDown" and "Embedding" not in m["id"]]
+                    return valid[0] if valid else "Qwen3.6-35B-A3B-MLX-4bit"
+        except Exception:
+            return "Qwen3.6-35B-A3B-MLX-4bit"
+    return model_name
+
+
+async def _get_omlx_stats_async() -> Optional[dict]:
     """获取 OMLX 管理统计信息，失败返回 None。"""
     try:
-        r = await client.get(OMLX_ADMIN_URL, headers=OMLX_HEADERS)
-        return r.json()
+        async with httpx.AsyncClient(timeout=5) as hc:
+            r = await hc.get(OMLX_ADMIN_URL, headers=OMLX_HEADERS)
+            return r.json()
     except Exception:
         return None
 
@@ -126,108 +147,142 @@ async def _get_omlx_stats(client: httpx.AsyncClient) -> Optional[dict]:
 
 def create_app() -> FastAPI:
     """创建并配置 FastAPI 应用实例。"""
-    app = FastAPI(title="Vkbro-MLX Agent Cache Proxy v2.7.0")
+    app = FastAPI(title="Vkbro-MLX Agent Cache Proxy v2.8.1")
     state = ProxyState()
-    client = httpx.AsyncClient(
-        timeout=HTTP_TIMEOUT,
-        limits=httpx.Limits(max_keepalive_connections=MAX_KEEPALIVE),
-    )
+
+    async def _omlx_post(payload: dict) -> httpx.Response:
+        """向 OMLX 发 POST，用全新客户端避免共享状态污染。"""
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as hc:
+            return await hc.post(OMLX_URL, json=payload, headers=OMLX_HEADERS)
+
+    async def _omlx_get(path: str, timeout: float = 5.0) -> httpx.Response:
+        """向 OMLX 发 GET，用全新客户端。"""
+        async with httpx.AsyncClient(timeout=timeout) as hc:
+            return await hc.get(path, headers=OMLX_HEADERS)
 
     # ── /v1/chat/completions ────────────────────────────────────────
 
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request) -> Any:
-        body = await request.json()
-        messages: list[dict] = body.get("messages", [])
-        tools: list[dict] = body.get("tools", [])
+        try:
+            body = await request.json()
+            messages: list[dict] = body.get("messages", [])
+            tools: list[dict] = body.get("tools", [])
 
-        tools_msg: Optional[dict] = None
-        if tools:
-            if state.frozen_tools_hash and state._frozen_tools_msg:
-                tools_msg = dict(state._frozen_tools_msg)
-            else:
-                tools_msg = _build_tools_message(tools)
-            if tools_msg:
-                messages = [tools_msg] + messages
+            tools_msg: Optional[dict] = None
+            if tools:
+                if state.frozen_tools_hash and state._frozen_tools_msg:
+                    tools_msg = dict(state._frozen_tools_msg)
+                else:
+                    tools_msg = _build_tools_message(tools)
+                if tools_msg:
+                    messages = [tools_msg] + messages
 
-        roles = [m.get("role", "?") for m in messages[:5]]
-        lengths = [len(json.dumps(m, ensure_ascii=False)) for m in messages[:5]]
-        state.log(f"[DEBUG] 收到{len(messages)}条消息, 角色:{roles}, 长度:{lengths}")
-        validate_or_freeze_anchor(state, messages, tools, tools_msg)
-        rebuilt = rebuild_messages(state, messages)
-        payload = {**body, "messages": rebuilt}
-        model_name = payload.get("model", "")
-        payload["model"] = await _resolve_model(client, state, model_name)
-        for m in payload["messages"]:
-            for k in (
-                "ephemeral",
-                "source_round",
-                "compressed_from_rounds",
-                "orphaned",
-                "checkpoint",
-            ):
-                m.pop(k, None)
+            roles = [m.get("role", "?") for m in messages[:5]]
+            lengths = [len(json.dumps(m, ensure_ascii=False)) for m in messages[:5]]
+            state.log(f"[DEBUG] 收到{len(messages)}条消息, 角色:{roles}, 长度:{lengths}")
+            validate_or_freeze_anchor(state, messages, tools, tools_msg)
+            rebuilt = rebuild_messages(state, messages)
+            payload = {**body, "messages": rebuilt}
+            model_name = payload.get("model", "")
+            payload["model"] = await _resolve_model_async(state, model_name)
+            for m in payload["messages"]:
+                for k in (
+                    "ephemeral",
+                    "source_round",
+                    "compressed_from_rounds",
+                    "orphaned",
+                    "checkpoint",
+                ):
+                    m.pop(k, None)
 
-        if not body.get("stream", False):
+            if not body.get("stream", False):
+                try:
+                    resp = await _omlx_post(payload)
+                    data = resp.json()
+                    u = data.get("usage", {})
+                    update_cache_health(
+                        state, extract_cached_tokens(u), u.get("prompt_tokens", 0)
+                    )
+                    state.total_turns += 1
+                    return data
+                except Exception as e:
+                    return JSONResponse(
+                        status_code=502, content={"error": {"message": str(e)}}
+                    )
+
             try:
-                resp = await client.post(OMLX_URL, json=payload, headers=OMLX_HEADERS)
-                data = resp.json()
-                u = data.get("usage", {})
-                update_cache_health(
-                    state, extract_cached_tokens(u), u.get("prompt_tokens", 0)
+                return StreamingResponse(
+                    _handle_stream(state, payload),
+                    media_type="text/event-stream",
+                    headers={
+                        "Cache-Control": "no-cache",
+                        "Connection": "keep-alive",
+                        "X-Accel-Buffering": "no",
+                    },
                 )
-                state.total_turns += 1
-                return data
             except Exception as e:
                 return JSONResponse(
-                    status_code=502, content={"error": {"message": str(e)}}
+                    status_code=500,
+                    content={"error": {"message": str(e), "type": type(e).__name__}},
                 )
-
-        return StreamingResponse(
-            _handle_stream(state, client, payload),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no",
-            },
-        )
+        except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            state.log(f"[handler异常] {type(e).__name__}: {e}")
+            state.log(f"[handler异常] 堆栈:\n{tb}")
+            return JSONResponse(
+                status_code=500,
+                content={"error": {"message": str(e), "type": type(e).__name__}},
+            )
 
     # ── SSE 流 ───────────────────────────────────────────────────────
 
     async def _handle_stream(
         state: ProxyState,
-        client: httpx.AsyncClient,
         payload: dict,
     ):
-        """SSE 流式代理 — 尾缓冲解析 usage，不缓存全量响应。"""
-        # 只保留最后 N 字节做 usage 解析，O(1) 内存
-        TAIL_BUFFER = 8192  # 最后 8KB 足够覆盖任意 usage 块
+        """SSE 流式代理 — 尾缓冲解析 usage，每次用新客户端。"""
+        TAIL_BUFFER = 8192
         tail_buf: bytes = b""
-        async with client.stream(
-            "POST", OMLX_URL, json=payload, headers=OMLX_HEADERS
-        ) as resp:
-            async for chunk in resp.aiter_bytes():
-                yield chunk
-                tail_buf += chunk
-                if len(tail_buf) > TAIL_BUFFER:
-                    tail_buf = tail_buf[-TAIL_BUFFER:]
-        u = parse_usage_from_sse([tail_buf])
-        p, c = _poll_mlx_status(state)
-        update_cache_health(
-            state,
-            c if c > 0 else extract_cached_tokens(u),
-            u.get("prompt_tokens", p) if u else p,
-        )
-        state.total_turns += 1
+        try:
+            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as hc:
+                async with hc.stream(
+                    "POST", OMLX_URL, json=payload, headers=OMLX_HEADERS
+                ) as resp:
+                    async for chunk in resp.aiter_bytes():
+                        yield chunk
+                        tail_buf += chunk
+                        if len(tail_buf) > TAIL_BUFFER:
+                            tail_buf = tail_buf[-TAIL_BUFFER:]
+            u = parse_usage_from_sse([tail_buf])
+            update_cache_health(
+                state,
+                extract_cached_tokens(u),
+                u.get("prompt_tokens", 0) if u else 0,
+            )
+            state.total_turns += 1
+        except Exception as e:
+            err_msg = f"[SSE代理异常] {type(e).__name__}: {e}"
+            state.log(err_msg)
+            yield json.dumps({
+                "error": {"message": str(e), "type": type(e).__name__},
+            }).encode() + b"\n"
 
     # ── /v1/models ───────────────────────────────────────────────────
 
     @app.get("/v1/models")
     async def list_models():
         try:
-            r = await client.get(OMLX_MODELS_URL, headers=OMLX_HEADERS)
-            return r.json()
+            data = await _omlx_get(OMLX_MODELS_URL)
+            j = data.json()
+            BLACKLIST = [
+                "Qwen3.5-122B-A10B-RAM-48GB-MLX",
+                "Qwen:Qwen3-Embedding",
+            ]
+            if "data" in j:
+                j["data"] = [m for m in j["data"] if not any(b in m["id"] for b in BLACKLIST)]
+            return j
         except Exception:
             return {"object": "list", "data": []}
 
@@ -235,21 +290,26 @@ def create_app() -> FastAPI:
 
     @app.get("/health")
     async def health():
-        wa = (
-            sum(state.hit_rate_window) / len(state.hit_rate_window)
-            if state.hit_rate_window
-            else 0
-        )
+        omlx = await _get_omlx_stats_async()
+        hot_blocks = 0
+        indexed_blocks = 0
+        if omlx:
+            for m in omlx.get("runtime_cache", {}).get("models", []):
+                hot_blocks = max(hot_blocks, m.get("hot_cache_entries", 0))
+                indexed_blocks = max(indexed_blocks, m.get("indexed_blocks", 0))
         return {
             "ok": True,
             "cache_state": state.cache_state,
-            "window_avg_hit_rate": round(wa, 4),
+            "window_avg_hit_rate": round(
+                sum(state.hit_rate_window) / len(state.hit_rate_window), 4
+            ) if state.hit_rate_window else 0,
             "frozen_prefix_hash": (state.frozen_prefix_hash or "")[:12],
             "frozen_token_count": state.frozen_token_count,
-            "ephemeral_count": len(state.ephemeral_buffer),
             "frozen_tools_count": state.frozen_tools_count,
             "total_turns": state.total_turns,
             "compressed": state.ephemeral_compressed,
+            "omlx_hot_blocks": hot_blocks,
+            "omlx_indexed_blocks": indexed_blocks,
             "last_request": {
                 "prompt_tokens": state.last_prompt_tokens,
                 "cached_tokens": state.last_cached_tokens,
@@ -343,7 +403,7 @@ def create_app() -> FastAPI:
 
     @app.get("/")
     async def dashboard():
-        omlx_data = await _get_omlx_stats(client)
+        omlx_data = await _get_omlx_stats_async()
         return HTMLResponse(render_dashboard(state, omlx_data))
 
     # ── /logs ────────────────────────────────────────────────────────

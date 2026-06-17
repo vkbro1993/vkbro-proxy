@@ -1,67 +1,47 @@
-# Changelog
+# CHANGELOG — v2.8.1
 
-## v2.7.0 (2026-06-15)
-
-### Modular Rewrite
-- Split 1045-line single file into 6 modules: `config.py`, `proxy_state.py`, `core.py`, `server.py`, `dashboard.py`, `proxy.py`
-- `ProxyState` class with `threading.Lock` replaces global `_state` dict — thread-safe singleton
-- External config via `.env` (`python-dotenv`)
-- Dashboard HTML extracted to dedicated module
-
-### Quality
-- 68 test cases (unit + verification), 100% pass rate
-- `create_app()` factory function for clean FastAPI instantiation
-- Dual import paths (relative + absolute) for flexible deployment
-
-### Bug Fixes
-- `_handle_stream`: replaced full-response accumulation with 8KB tail buffer (O(1) memory)
-- `_update_stable_blocks`: exceptions now logged instead of silently swallowed
-- Removed dead `is_current_turn` variable in `rebuild_messages`
-
-### Documentation
-- English README with Custom Agent Integration guide
-- Added `LICENSE` (MIT), `requirements.txt`, `.gitignore`, `CHANGELOG.md`
+**发布日期：** 2026年6月17日
 
 ---
 
-## v2.6.4 (2026-06-14)
+## 新增：已加载技能清单（防止模型重复加载技能）
 
-- Auto model detection — queries OMLX for current model instead of hardcoding
-- Proxy block map (anchor green / dialogue orange / ephemeral gray)
-- Dashboard condensed to 4 overview cards + proxy vs OMLX comparison
-- Control buttons: freeze old dialogue, restart OMLX
+### 痛点
+
+模型每轮都会重复调用 `skill_view` 加载同样的技能（最高 11 条/轮）。代理虽然正确把技能结果抽到瞬态块，但瞬态块每轮被新内容覆盖，模型看不到"已加载"标记，于是下轮继续加载，形成循环。
+
+每次循环浪费：
+- 11 次工具调用
+- 数 KB 的技能文档进入上下文
+- 模型推理时间无意义增加
+
+### 修复
+
+**proxy_state.py：** 新增 `_loaded_skill_names` 集合，记录已加载的技能名。
+
+**core.py rebuild_messages()：** 
+1. 处理技能结果时，将技能名记入 `_loaded_skill_names`
+2. 返回重组结果前，在对话块开头插入 System 消息：
+   ```
+   [已加载技能: doc-to-markdown、maps、notion] 
+   以下技能已在本次会话中加载过，无需重复加载。
+   ```
+3. 此消息放在对话块中（非瞬态块），不会被压缩或覆盖
+4. 新会话 (`/reset`) 自动清空技能清单
+
+### 效果
+
+| 指标 | 改前 | 改后 |
+|------|------|------|
+| 每轮 skill_view 次数 | 11 次 | 首次加载后为 0 |
+| 对话块负担 | 每轮被技能文档反复填充 | 一条简短 System 消息 |
+| 模型重复劳动 | 每轮相同加载 | 识别清单后跳过 |
 
 ---
 
-## v2.6.3 (2026-06-14)
+## 已有功能回顾（v2.8.x）
 
-- Real truncation: keep only last 5 turns, summarize old user messages
-- Summary placed permanently at start of dialogue block
-
----
-
-## v2.6.2 (2026-06-14)
-
-- Anchor fix: don't freeze when no system messages present
-- Tool result repositioning: results → dialogue block (KV cached), calls → ephemeral
-- Fixed tool result stacking causing model repetition
-- Dashboard model matching by active OMLX model
-
----
-
-## v2.6.1 (2026-06-14)
-
-- Ephemeral block fix: only current-turn tool interactions in transient
-- Fixed 39-item ephemeral accumulation causing model loop
-
----
-
-## v2.6 (2026-06-12)
-
-- Initial three-block architecture: anchor + dialogue + ephemeral
-- Tool definitions locked into anchor block
-- Auto-freeze after 2-turn warmup
-- Auto-checkpoint at 40-block threshold
-- Auto-compress ephemeral at 4000 token threshold
-- Cache health monitoring
-- Dashboard WebUI
+| 版本 | 变更 |
+|------|------|
+| v2.8.0 | 独立 HTTP 客户端（修 OSError 500）；看门狗自动重启；命中率改为真实 OMLX 缓存数据；大工具输出截断；模型黑名单过滤 |
+| v2.8.1 | 已加载技能清单（防止模型重复 skill_view） |

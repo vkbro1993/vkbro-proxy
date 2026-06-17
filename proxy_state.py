@@ -1,5 +1,5 @@
 """
-Vkbro-MLX Agent Cache Proxy v2.7.0 — 状态管理模块
+Vkbro-MLX Agent Cache Proxy v2.8.1 — 状态管理模块
 =================================================
 ProxyState 单例类，替代原 _state 全局 dict + _checkpoint_count + _log_buffer + _MAX_LOG。
 所有状态变更通过 threading.Lock 保护。
@@ -59,6 +59,7 @@ class ProxyState:
         # ---- 消费追踪 ----
         self._consumed_skill_ids: set = set()
         self._consumed_tool_ids: set = set()
+        self._loaded_skill_names: set = set()  # 已加载的技能名列表
 
         # ---- 块统计 ----
         self._stable_hot_blocks: int = 0
@@ -96,7 +97,10 @@ class ProxyState:
             self._log_buffer.append(entry)
             if len(self._log_buffer) > self._MAX_LOG:
                 self._log_buffer.pop(0)
-        print(entry, flush=True)
+        try:
+            print(entry, flush=True)
+        except OSError:
+            pass  # stdout 被关闭时不报错（如 Hermes Studio 断开子进程连接）
 
     # ── 检查点计数 ──────────────────────────────────────────────────
 
@@ -123,6 +127,7 @@ class ProxyState:
             self.hit_rate_window = []
             self._consumed_skill_ids = set()
             self._consumed_tool_ids = set()
+            self._loaded_skill_names = set()
             self.frozen_tools_hash = None
             self.frozen_tools_count = 0
             self._frozen_tools_msg = None

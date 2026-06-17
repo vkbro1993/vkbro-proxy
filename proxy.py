@@ -1,6 +1,6 @@
 #!/usr/bin/env python3.11
 """
-Vkbro-MLX Agent Cache Proxy v2.7.0
+Vkbro-MLX Agent Cache Proxy v2.8.1.1
 =================================
 本地 OMLX 单模型 + Hermes 单会话独占。
 三块结构：锚定块(锁死) + 对话块(稳定) + 瞬态块(孤儿/技能/工具/缓冲)
@@ -37,20 +37,48 @@ from server import create_app  # noqa: E402
 
 
 def main() -> None:
-    """创建 FastAPI 应用并启动 uvicorn 服务器。"""
-    app = create_app()
-    print(f"Vkbro Cache Proxy v2.7.0 → http://localhost:{PROXY_PORT}")
+    """创建 FastAPI 应用并启动 uvicorn 服务器（带看门狗）。"""
+    max_retries = 5
+    retry_count = 0
+    while True:
+        try:
+            retry_count = 0
+            app = create_app()
+            try:
+                print(f"Vkbro Cache Proxy v2.8.1 → http://localhost:{PROXY_PORT}")
+            except OSError:
+                pass
 
-    config = uvicorn.Config(app, host=PROXY_HOST, port=PROXY_PORT, log_level="warning")
-    server = uvicorn.Server(config)
+            config = uvicorn.Config(app, host=PROXY_HOST, port=PROXY_PORT, log_level="warning")
+            server = uvicorn.Server(config)
 
-    async def serve() -> None:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind((PROXY_HOST, PROXY_PORT))
-        await server.serve(sockets=[sock])
+            async def serve() -> None:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                sock.bind((PROXY_HOST, PROXY_PORT))
+                await server.serve(sockets=[sock])
 
-    asyncio.run(serve())
+            asyncio.run(serve())
+        except OSError as e:
+            if "[Errno 48]" in str(e) or "Address already in use" in str(e):
+                retry_count += 1
+                print(f"[看门狗] 端口 {PROXY_PORT} 被占用，尝试释放... ({retry_count}/{max_retries})")
+                import subprocess
+                subprocess.run(f"kill $(lsof -t -i :{PROXY_PORT}) 2>/dev/null", shell=True)
+                import time
+                time.sleep(2)
+                if retry_count >= max_retries:
+                    print(f"[看门狗] 无法释放端口 {PROXY_PORT}，请检查是否有其他服务占用")
+                    break
+            else:
+                print(f"[看门狗] Proxy 异常退出: {e}")
+                import time
+                time.sleep(3)
+        except Exception as e:
+            print(f"[看门狗] Proxy 异常退出: {e}")
+            print(f"[看门狗] 3 秒后自动重启...")
+            import time
+            time.sleep(3)
 
 
 if __name__ == "__main__":

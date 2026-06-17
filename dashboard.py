@@ -1,5 +1,5 @@
 """
-Vkbro-MLX Agent Cache Proxy v2.7.0 — Dashboard HTML 生成
+Vkbro-MLX Agent Cache Proxy v2.8.1 — Dashboard HTML 生成
 ========================================================
 从原 proxy.py 的 dashboard() 路由函数中提取 HTML 生成逻辑。
 """
@@ -229,7 +229,7 @@ _DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 <html lang="zh">
 <head>
 <meta charset="utf-8">
-<title>Vkbro-MLX Cache Proxy v2.7.0</title>
+<title>Vkbro-MLX Cache Proxy v2.8.1</title>
 <style>
 *,*::before,*::after{{margin:0;padding:0;box-sizing:border-box}}
 body{{
@@ -337,7 +337,7 @@ tr:hover td{{background:#fafafa}}
 <div class="main-col-inner">
 
 <div class="topbar">
-  <h1>Vkbro-MLX Cache Proxy v2.7.0</h1>
+  <h1>Vkbro-MLX Cache Proxy v2.8.1</h1>
   <div class="status">
     <span class="badge"><span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:{cache_color}"></span> {state_label}</span>
     自动刷新 · 每4秒
